@@ -1,46 +1,8 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const store = require("./store");
+const rules = require("./rules");
 
 const PORT = Number(process.env.PORT || 3021);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  clocks: [
-    {
-      id: "clock_demo",
-      code: "CLK-1890-07",
-      escapementType: "瑞士杠杆式",
-      balanceFrequency: "18000vph",
-      targetDailyRateSeconds: 20,
-      note: "怀表机芯，走时偏快",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  adjustments: [
-    {
-      id: "adjustment_demo",
-      clockId: "clock_demo",
-      currentDailyRateSeconds: 68,
-      direction: "慢针方向",
-      amount: "游丝快慢针向慢侧微调0.4格",
-      note: "初次调校，先保守处理",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  retests: [
-    {
-      id: "retest_demo",
-      clockId: "clock_demo",
-      adjustmentId: "adjustment_demo",
-      testedAt: new Date().toISOString(),
-      dailyRateSeconds: 31,
-      amplitude: 248,
-      qualified: false,
-      note: "仍偏快，振幅尚可"
-    }
-  ]
-};
 
 const routes = [
   "GET /health",
@@ -52,26 +14,15 @@ const routes = [
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "POST /clocks/:id/stop-oil-orders",
+  "GET /clocks/:id/stop-oil-orders",
+  "GET /stop-oil-orders",
+  "GET /stop-oil-orders/:id",
+  "POST /stop-oil-orders/:id/reviews",
+  "POST /stop-oil-orders/:id/corrections",
+  "POST /stop-oil-orders/:id/part-replacements"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -89,10 +40,6 @@ async function parseBody(req) {
     error.status = 400;
     throw error;
   }
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function required(body, fields) {
@@ -129,24 +76,27 @@ function latestAdjustment(db, clockId) {
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const openStopOilOrder = rules.findOpenOrder(db, clock.id);
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified: retest ? retest.qualified : false,
+    openStopOilOrder: openStopOilOrder ? rules.summarizeOrder(openStopOilOrder) : null,
+    adjustmentAllowed: !openStopOilOrder
   };
 }
 
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
-  const db = await readDb();
 
   if (req.method === "GET" && pathname === "/health") {
     return send(res, 200, { ok: true, service: "clock-escapement-tuning-api", routes });
   }
 
   if (req.method === "GET" && pathname === "/clocks") {
+    const db = await store.readDb();
     const qualified = url.searchParams.get("qualified");
     let data = db.clocks.map((clock) => clockSummary(db, clock));
     if (qualified !== null) {
@@ -159,27 +109,31 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/clocks") {
     const body = await parseBody(req);
     required(body, ["code", "escapementType", "balanceFrequency"]);
-    const clock = {
-      id: makeId("clock"),
-      code: body.code,
-      escapementType: body.escapementType,
-      balanceFrequency: body.balanceFrequency,
-      targetDailyRateSeconds: Number(body.targetDailyRateSeconds ?? 30),
-      note: body.note || "",
-      createdAt: new Date().toISOString()
-    };
-    db.clocks.push(clock);
-    await writeDb(db);
-    return send(res, 201, { data: clockSummary(db, clock) });
+    const result = await store.transact(async (db) => {
+      const clock = {
+        id: store.makeId("clock"),
+        code: body.code,
+        escapementType: body.escapementType,
+        balanceFrequency: body.balanceFrequency,
+        targetDailyRateSeconds: Number(body.targetDailyRateSeconds ?? 30),
+        note: body.note || "",
+        createdAt: new Date().toISOString()
+      };
+      db.clocks.push(clock);
+      return clockSummary(db, clock);
+    });
+    return send(res, 201, { data: result });
   }
 
   if (req.method === "GET" && pathname === "/clocks/not-qualified") {
+    const db = await store.readDb();
     const data = db.clocks.map((clock) => clockSummary(db, clock)).filter((clock) => !clock.qualified);
     return send(res, 200, { data });
   }
 
   const historyMatch = pathname.match(/^\/clocks\/([^/]+)\/history$/);
   if (historyMatch && req.method === "GET") {
+    const db = await store.readDb();
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
@@ -188,59 +142,67 @@ async function handle(req, res) {
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
   if (adjustmentMatch && req.method === "POST") {
-    const clock = findClock(db, adjustmentMatch[1]);
     const body = await parseBody(req);
     required(body, ["currentDailyRateSeconds", "direction", "amount"]);
-    const adjustment = {
-      id: makeId("adjustment"),
-      clockId: clock.id,
-      currentDailyRateSeconds: Number(body.currentDailyRateSeconds),
-      direction: body.direction,
-      amount: body.amount,
-      note: body.note || "",
-      createdAt: new Date().toISOString()
-    };
-    db.adjustments.push(adjustment);
-    await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    const result = await store.transact(async (db) => {
+      const clock = findClock(db, adjustmentMatch[1]);
+      rules.assertAdjustmentAllowed(db, clock.id);
+      const adjustment = {
+        id: store.makeId("adjustment"),
+        clockId: clock.id,
+        currentDailyRateSeconds: Number(body.currentDailyRateSeconds),
+        direction: body.direction,
+        amount: body.amount,
+        note: body.note || "",
+        createdAt: new Date().toISOString()
+      };
+      db.adjustments.push(adjustment);
+      return { adjustment, clock: clockSummary(db, clock) };
+    });
+    return send(res, 201, { data: result.adjustment, clock: result.clock });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
   if (retestMatch && req.method === "POST") {
-    const clock = findClock(db, retestMatch[1]);
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
-    const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
-    const qualified = body.qualified !== undefined
-      ? Boolean(body.qualified)
-      : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
-    const retest = {
-      id: makeId("retest"),
-      clockId: clock.id,
-      adjustmentId,
-      testedAt: body.testedAt || new Date().toISOString(),
-      dailyRateSeconds: Number(body.dailyRateSeconds),
-      amplitude: Number(body.amplitude),
-      qualified,
-      note: body.note || ""
-    };
-    db.retests.push(retest);
-    await writeDb(db);
-    return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
+    const result = await store.transact(async (db) => {
+      const clock = findClock(db, retestMatch[1]);
+      const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
+      const qualified = body.qualified !== undefined
+        ? Boolean(body.qualified)
+        : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
+      const retest = {
+        id: store.makeId("retest"),
+        clockId: clock.id,
+        adjustmentId,
+        testedAt: body.testedAt || new Date().toISOString(),
+        dailyRateSeconds: Number(body.dailyRateSeconds),
+        amplitude: Number(body.amplitude),
+        qualified,
+        note: body.note || ""
+      };
+      db.retests.push(retest);
+      return { retest, clock: clockSummary(db, clock) };
+    });
+    return send(res, 201, { data: result.retest, clock: result.clock });
   }
 
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
   if (latestMatch && req.method === "GET") {
+    const db = await store.readDb();
     findClock(db, latestMatch[1]);
     return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
   }
 
   if (req.method === "GET" && pathname === "/adjustments") {
+    const db = await store.readDb();
     const clockId = url.searchParams.get("clockId");
     return send(res, 200, { data: db.adjustments.filter((item) => !clockId || item.clockId === clockId) });
   }
 
   if (req.method === "GET" && pathname === "/retests") {
+    const db = await store.readDb();
     const clockId = url.searchParams.get("clockId");
     const qualified = url.searchParams.get("qualified");
     const data = db.retests.filter((item) => {
@@ -249,6 +211,84 @@ async function handle(req, res) {
       return matchClock && matchQualified;
     });
     return send(res, 200, { data });
+  }
+
+  // 登记停油单：每表仅一张未结束停油单，重复或并发沿用首次
+  const stopOilCreateMatch = pathname.match(/^\/clocks\/([^/]+)\/stop-oil-orders$/);
+  if (stopOilCreateMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const result = await store.transact(async (db) => {
+      const clock = findClock(db, stopOilCreateMatch[1]);
+      return rules.createStopOilOrder(db, clock, body);
+    });
+    return send(res, result.reused ? 200 : 201, {
+      data: rules.summarizeOrder(result.order),
+      reused: result.reused
+    });
+  }
+
+  // 停油履历：某只表的全部停油单（含已放行）
+  if (stopOilCreateMatch && req.method === "GET") {
+    const db = await store.readDb();
+    const clock = findClock(db, stopOilCreateMatch[1]);
+    const data = db.stopOilOrders
+      .filter((order) => order.clockId === clock.id)
+      .map((order) => rules.summarizeOrder(order));
+    return send(res, 200, { data });
+  }
+
+  // 停油单列表：刷新后与履历、详情一致
+  if (req.method === "GET" && pathname === "/stop-oil-orders") {
+    const db = await store.readDb();
+    const clockId = url.searchParams.get("clockId");
+    const status = url.searchParams.get("status");
+    const open = url.searchParams.get("open");
+    const data = db.stopOilOrders
+      .filter((order) => !clockId || order.clockId === clockId)
+      .filter((order) => !status || order.status === status)
+      .filter((order) => open === null || (open === "true") === (order.status !== rules.STATUS.RELEASED))
+      .map((order) => rules.summarizeOrder(order));
+    return send(res, 200, { data });
+  }
+
+  const stopOilDetailMatch = pathname.match(/^\/stop-oil-orders\/([^/]+)$/);
+  if (stopOilDetailMatch && req.method === "GET") {
+    const db = await store.readDb();
+    const order = rules.findOrder(db, stopOilDetailMatch[1]);
+    const versions = db.stopOilOrderVersions.filter((item) => item.orderId === order.id);
+    return send(res, 200, { data: { ...rules.summarizeOrder(order), archivedVersions: versions } });
+  }
+
+  const reviewMatch = pathname.match(/^\/stop-oil-orders\/([^/]+)\/reviews$/);
+  if (reviewMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const result = await store.transact(async (db) => {
+      const order = rules.findOrder(db, reviewMatch[1]);
+      return rules.addReview(db, order, body);
+    });
+    return send(res, result.reused ? 200 : 201, {
+      data: result.review,
+      order: rules.summarizeOrder(result.order),
+      reused: result.reused
+    });
+  }
+
+  const correctionMatch = pathname.match(/^\/stop-oil-orders\/([^/]+)\/corrections$/);
+  if (correctionMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const order = await store.transact(async (db) =>
+      rules.correctOilAmount(db, rules.findOrder(db, correctionMatch[1]), body)
+    );
+    return send(res, 200, { data: rules.summarizeOrder(order) });
+  }
+
+  const partMatch = pathname.match(/^\/stop-oil-orders\/([^/]+)\/part-replacements$/);
+  if (partMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const order = await store.transact(async (db) =>
+      rules.replacePart(db, rules.findOrder(db, partMatch[1]), body)
+    );
+    return send(res, 200, { data: rules.summarizeOrder(order) });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
